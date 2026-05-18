@@ -1,0 +1,101 @@
+name: RDP
+
+permissions:
+actions: write
+contents: read
+
+on:
+workflow_dispatch:
+
+jobs:
+secure-rdp:
+runs-on: windows-latest
+timeout-minutes: 355
+
+steps:
+  - name: Configure RDP
+    shell: powershell
+    run: |
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+      Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+
+      Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+
+      Restart-Service TermService -Force
+
+  - name: Remove Old User
+    shell: powershell
+    continue-on-error: true
+    run: |
+      net user RDP /delete
+
+  - name: Create RDP User
+    shell: powershell
+    run: |
+      $password = "QuickCloud@123"
+      $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+      New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+
+      Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+      Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+      echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+      echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+
+  - name: Install Tailscale
+    shell: powershell
+    run: |
+      Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "$env:TEMP\tailscale.msi"
+
+      Start-Process msiexec.exe -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" -Wait
+
+  - name: Connect Tailscale
+    shell: powershell
+    run: |
+      & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-${{ github.run_id }}
+
+      Start-Sleep 15
+
+      $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+      echo "TS_IP=$ip" >> $env:GITHUB_ENV
+
+  - name: Show RDP Details
+    shell: powershell
+    run: |
+      Write-Host ""
+      Write-Host "==========================="
+      Write-Host "RDP READY"
+      Write-Host "IP: $env:TS_IP"
+      Write-Host "USER: $env:RDP_USER"
+      Write-Host "PASS: $env:RDP_PASS"
+      Write-Host "==========================="
+      Write-Host ""
+
+  - name: Keep Alive
+    shell: powershell
+    run: |
+      $end = (Get-Date).AddMinutes(350)
+
+      while ((Get-Date) -lt $end) {
+        Write-Host "[$(Get-Date)] Running..."
+        Start-Sleep -Seconds 300
+      }
+
+  - name: Restart Workflow
+    if: always()
+    shell: powershell
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      Invoke-RestMethod `
+        -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp.yml/dispatches" `
+        -Method POST `
+        -Headers @{
+          Authorization = "Bearer $env:GH_TOKEN"
+          Accept = "application/vnd.github+json"
+        } `
+        -Body '{"ref":"main"}'
